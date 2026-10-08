@@ -11,8 +11,11 @@
 #
 # Fake secrets are generated at run time from random bytes, so this
 # repository never contains anything that looks like a real credential.
-
-set -o pipefail
+#
+# No `set -o pipefail` here, on purpose: checks like `unzip -Z1 | grep -q`
+# stop reading early, the writer gets SIGPIPE, and with pipefail the result
+# depends on timing (a found file reported missing, or worse, a leaked value
+# reported absent). Without it, a pipeline's status is the grep's status.
 
 HERE=$(cd "$(dirname "$0")" && pwd -P)
 ZIPROJ="$HERE/../bin/ziproj"

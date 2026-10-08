@@ -10,9 +10,9 @@ permissions:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install linters
         run: sudo apt-get update && sudo apt-get install -y shellcheck mandoc zsh fish
       - run: make lint
@@ -23,13 +23,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Ubuntu pinned: its gitleaks package (8.16, no `dir` command) keeps the
+        # fallback code path tested; macOS gets the current Homebrew release.
+        os: [ubuntu-24.04, macos-latest]
         gitleaks: [true, false]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      # Ubuntu's package is an older gitleaks (no `dir` command), macOS gets the
-      # current release: together they cover both code paths in ziproj.
       - name: Install gitleaks and jq (Ubuntu)
         if: matrix.gitleaks && runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y gitleaks jq
