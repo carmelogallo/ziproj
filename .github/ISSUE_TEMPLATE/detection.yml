@@ -1,0 +1,30 @@
+name: Missed file or false positive
+description: A file or token format that should be excluded or detected, or a finding that should not be one.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste a real secret.** Describe the format (prefix, length, characters) and use a fake value.
+        If you think a secret got past ziproj in a way that could affect others, report it privately: Security tab → Report a vulnerability.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - A file that should be excluded by default
+        - A secret format that should be detected
+        - A false positive
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: File name and the tools that create it, or the token format and the provider that issues it, or the line that was flagged (with fake values).
+    validations:
+      required: true
+  - type: input
+    id: docs
+    attributes:
+      label: Reference
+      description: Link to the provider's documentation about the file or token format, if any.

@@ -1,0 +1,15 @@
+#compdef ziproj
+# zsh completion for ziproj - https://github.com/carmelogallo/ziproj
+
+_arguments -s -S \
+    '(-n --dry-run)'{-n,--dry-run}'[list and scan, write nothing]' \
+    '(-r --redact)'{-r,--redact}'[replace detected secrets with REDACTED in the zip]' \
+    '(-a --ai)'{-a,--ai}'[also drop images, PDFs, fonts, audio and video]' \
+    '*'{-x+,--exclude=}'[exclude a file, folder or glob]:pattern:_files' \
+    '(-o --out)'{-o+,--out=}'[folder for the zip]:folder:_directories' \
+    '(-f --force)'{-f,--force}'[write the zip even with secrets in plain text]' \
+    '--no-gitleaks[do not use gitleaks, and do not ask]' \
+    '--no-open[do not reveal the zip in Finder or the file manager]' \
+    '(- *)'{-h,--help}'[show help]' \
+    '(- *)'{-V,--version}'[show the version]' \
+    '1:project folder:_directories'

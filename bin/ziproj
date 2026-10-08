@@ -1,0 +1,899 @@
+#!/usr/bin/env bash
+#
+# ziproj - zip a project so you can share it with an AI assistant or a
+# colleague, without leaking secrets or shipping build output and caches.
+#
+#   https://github.com/carmelogallo/ziproj
+#   SPDX-License-Identifier: MIT
+#
+# How it works, in order:
+#   1. List the files. Inside a git repository: `git ls-files`, so .gitignore
+#      is honoured. In a folder that is not a repository: every nested
+#      repository is listed through git, everything else through `find`.
+#   2. Zip that list into a temporary folder, applying a built-in denylist of
+#      secrets and junk (build output, caches, dependencies), plus the user's
+#      ignore files and -x patterns.
+#   3. Scan exactly what ended up in the zip for secrets: built-in patterns,
+#      plus gitleaks when it is installed.
+#   4. Secrets found: block (default), or replace them with REDACTED inside
+#      the zip (-r) and scan again to verify. The user's files are never
+#      modified.
+#   5. Move the zip to its destination only when everything above passed.
+#
+# Portability: macOS (bash 3.2, BSD tools) and Linux (bash 4/5, GNU tools).
+# Do not use bash 4+ features here: no associative arrays, no mapfile, no
+# ${var,,}, no [[ -v ]], no negative array indexes.
+
+set -o pipefail
+
+readonly ZIPROJ_VERSION="1.0.0"
+readonly ZIPROJ_URL="https://github.com/carmelogallo/ziproj"
+
+GITLEAKS=${ZIPROJ_GITLEAKS:-gitleaks}
+GITLEAKS_CONFIG_FILE=${ZIPROJ_GITLEAKS_CONFIG:-}
+JQ=${ZIPROJ_JQ:-jq}
+
+# --------------------------------------------------------------------------
+# Default denylist. These rules apply to every file, tracked by git or not.
+# Zip patterns: '*' also matches '/', so "X" plus "*/X" covers any depth.
+# --------------------------------------------------------------------------
+
+# Files that hold, or usually hold, secrets. Matched in any letter case, since
+# the default macOS file system treats .ENV and .env as the same name.
+SECRET_FILES=(
+    .env '.env.*' '*.env' .envrc .dev.vars
+    .netrc .npmrc .yarnrc.yml .pypirc .pgpass .git-credentials .htpasswd
+    '*.pem' '*.key' '*.p8' '*.p12' '*.pfx' '*.cer' '*.crt' '*.der' '*.csr' '*.certSigningRequest'
+    '*.mobileprovision' '*.provisionprofile' '*.jks' '*.keystore' '*.jwks' '*.ppk' '*.gpg' '*.kdbx' '*.har'
+    'id_rsa*' 'id_dsa*' 'id_ecdsa*' 'id_ed25519*'
+    'GoogleService-Info*.plist' google-services.json
+    '*service-account*.json' '*service_account*.json' '*-adminsdk-*.json' 'client_secret*.json' credentials.json
+    '[Ss]ecret.*' '[Ss]ecrets.*' '*.secret' '*.secrets'
+    local.properties keystore.properties master.key
+    '*.tfvars' '*.tfstate' '*.tfstate.*'
+    '*.sqlite' '*.sqlite3' '*.sqlite-*' '*.db' '*.db-*' '*.realm' '*.dump'
+)
+
+# Files that only add weight: OS litter, logs, compiled objects, packages, archives.
+JUNK_FILES=(
+    .DS_Store '._*' Thumbs.db '*.log' '*.swp' '*.swo' '*~' '*.orig'
+    '*.xcuserstate' '*.iml' '*.pyc' '*.pyo' '*.class' '*.o' '*.tsbuildinfo' .eslintcache
+    '*.ipa' '*.apk' '*.aab' '*.zip' '*.tar' '*.tar.gz' '*.tgz' '*.7z' '*.rar'
+)
+
+# Directories excluded with everything inside them (secret ones in any letter case).
+SECRET_DIRS=(.ssh .aws .gnupg .docker .kube .azure .keystore secrets .secrets)
+JUNK_DIRS=(
+    .git .svn .hg
+    .build .swiftpm DerivedData Derived xcuserdata Pods Carthage/Build
+    '*.xcarchive' '*.xcresult' '*.dSYM' '*.app' fastlane/test_output fastlane/screenshots
+    build .gradle .kotlin .cxx .externalNativeBuild .idea captures
+    node_modules .npm .pnpm-store dist .next .nuxt .svelte-kit .output .turbo .vercel .netlify
+    .parcel-cache .cache coverage .nyc_output .expo
+    __pycache__ .venv venv .mypy_cache .pytest_cache .ruff_cache .tox '*.egg-info'
+    target .terraform .serverless
+)
+
+# Extra extensions dropped by --ai (matched case-insensitively).
+AI_EXTENSIONS=(
+    png jpg jpeg gif webp heic heif tif tiff bmp ico icns pdf
+    ttf otf woff woff2
+    mp4 mov m4v webm avi mp3 m4a aac wav aif aiff caf
+    psd sketch fig
+)
+
+# Built-in secret patterns (POSIX ERE, so they run on BSD and GNU grep).
+# They are a safety net; gitleaks, when installed, does the heavy lifting.
+# shellcheck disable=SC2016 # literal $ and {} inside a bracket expression
+SECRET_PATTERNS=(
+    '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY'                              # PEM / OpenSSH private keys
+    '(AKIA|ASIA)[0-9A-Z]{16}'                                          # AWS access key id
+    'AIza[0-9A-Za-z_-]{35}'                                            # Google API key
+    '(^|[^A-Za-z0-9_-])sk-(proj-|ant-|svcacct-)?[A-Za-z0-9_-]{32,}'    # OpenAI / Anthropic
+    'gh[pousr]_[A-Za-z0-9]{36}'                                        # GitHub tokens
+    'github_pat_[A-Za-z0-9_]{50,}'                                     # GitHub fine-grained token
+    'glpat-[A-Za-z0-9_-]{20,}'                                         # GitLab token
+    'xox[abposr]-[A-Za-z0-9-]{10,}'                                    # Slack token
+    'hooks\.slack\.com/services/T[A-Za-z0-9/]+'                        # Slack webhook
+    '[rs]k_(live|test)_[A-Za-z0-9]{20,}'                               # Stripe secret / restricted key
+    'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'                         # SendGrid
+    'npm_[A-Za-z0-9]{36}'                                              # npm token
+    'hf_[A-Za-z0-9]{34}'                                               # Hugging Face
+    'GOCSPX-[A-Za-z0-9_-]{28}'                                         # Google OAuth client secret
+    'AccountKey=[A-Za-z0-9+/=]{40,}'                                   # Azure storage
+    '(postgres|postgresql|mysql|mongodb(\+srv)?|rediss?|amqps?)://[^:@/ ${}]+:[^@/ ${}]+@'  # URL with password
+    'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' # JWT
+)
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+E_RED='' E_YEL='' E_DIM='' E_BLD='' E_OFF=''
+O_GRN='' O_DIM='' O_BLD='' O_OFF=''
+if [ -z "${NO_COLOR:-}" ] && [ "${TERM:-}" != dumb ]; then
+    if [ -t 2 ]; then
+        E_RED=$'\033[31m' E_YEL=$'\033[33m' E_DIM=$'\033[2m' E_BLD=$'\033[1m' E_OFF=$'\033[0m'
+    fi
+    if [ -t 1 ]; then
+        O_GRN=$'\033[32m' O_DIM=$'\033[2m' O_BLD=$'\033[1m' O_OFF=$'\033[0m'
+    fi
+fi
+
+COLS=80
+if [ -t 2 ]; then
+    COLS=$(tput cols 2>/dev/null || echo 80)
+    case $COLS in '' | *[!0-9]*) COLS=80 ;; esac
+fi
+
+# Single status line that rewrites itself in place (only on a terminal).
+say() {
+    [ -t 2 ] || return 0
+    printf '\r\033[K' >&2
+    [ $# -gt 0 ] || return 0
+    local msg="$*" width=$((COLS - 4))
+    [ "$width" -ge 20 ] || width=20
+    [ "${#msg}" -le "$width" ] || msg="${msg:0:$((width - 1))}…"
+    printf '  %s%s%s' "$E_DIM" "$msg" "$E_OFF" >&2
+}
+
+die() {
+    say
+    printf '%sziproj:%s %s\n' "$E_RED" "$E_OFF" "$*" >&2
+    exit 1
+}
+
+usage_error() {
+    printf 'ziproj: %s\n' "$*" >&2
+    printf "Try 'ziproj --help' for more information.\n" >&2
+    exit 2
+}
+
+usage() {
+    cat <<EOF
+ziproj $ZIPROJ_VERSION - zip a project to share with an AI assistant or a colleague,
+without secrets, build output or caches.
+
+Usage: ziproj [options] [directory]
+
+Options:
+  -n, --dry-run        list what would be zipped and scan it; write nothing
+  -r, --redact         replace detected secrets with REDACTED inside the zip
+                       instead of blocking (your files are never modified)
+  -a, --ai             AI mode: also drop images, PDFs, fonts, audio and video
+  -x, --exclude PAT    exclude a file, directory or glob (repeatable;
+                       a leading / anchors it to the project root)
+  -o, --out DIR        where to write the zip (default: \$ZIPROJ_OUT or ~/Downloads)
+  -f, --force          write the zip even with secrets in plain text (use -r instead)
+      --no-gitleaks    do not use gitleaks, and do not ask about it
+      --no-open        do not reveal the zip in Finder or the file manager
+  -h, --help           show this help
+  -V, --version        show the version
+
+Ignore files (one rule per line, # starts a comment):
+  .ziprojignore                in the project, and in each nested repository
+  ~/.config/ziproj/ignore      applies to every project
+    generated/                 exclude at any depth
+    /docs                      exclude only at the root
+    noscan: Tests/Fixtures     keep in the zip, skip the secret scan
+
+Exit status: 0 zip written (or clean dry run), 1 blocked or error, 2 usage error.
+
+Docs: $ZIPROJ_URL
+EOF
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+have_gitleaks() { [ "$NO_GITLEAKS" = 0 ] && have "$GITLEAKS"; }
+have_jq() { have "$JQ"; }
+
+# contains NEEDLE [ITEM...]
+contains() {
+    local needle=$1 item
+    shift
+    for item in "$@"; do
+        [ "$item" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+# A finding is "path:line" or "path:line (rule)". Print the path.
+hit_path() {
+    local re='^(.*):[0-9]+( \([^)]*\))?$'
+    if [[ $1 =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; else printf '%s' "$1"; fi
+}
+
+# Print "path:line" without the "(rule)" suffix, to deduplicate findings.
+hit_key() {
+    local re='^(.*:[0-9]+) \([^)]*\)$'
+    if [[ $1 =~ $re ]]; then printf '%s' "${BASH_REMATCH[1]}"; else printf '%s' "$1"; fi
+}
+
+# Patterns on stdin -> case-insensitive patterns on stdout: *.pem -> *.[pP][eE][mM].
+# zip -x has no case-insensitive switch on Unix. Existing [...] sets are kept.
+ci_patterns() {
+    LC_ALL=C awk '{
+        out = ""; inset = 0
+        for (i = 1; i <= length($0); i++) {
+            c = substr($0, i, 1)
+            if (inset) { out = out c; if (c == "]") inset = 0; continue }
+            if (c == "[") { inset = 1; out = out c; continue }
+            if (c ~ /[A-Za-z]/) out = out "[" tolower(c) toupper(c) "]"
+            else out = out c
+        }
+        print out
+    }'
+}
+
+# add_rule PREFIX RULE - gitignore-like rule to zip patterns.
+# "/x" is anchored to PREFIX; anything else matches at any depth below it.
+add_rule() {
+    local pre=$1 p=$2
+    case $p in
+        /*)
+            p=${p#/}
+            p=${p%/}
+            [ -n "$p" ] && EXCLUDES+=("$pre$p" "$pre$p/*")
+            ;;
+        *)
+            p=${p%/}
+            [ -n "$p" ] && EXCLUDES+=("$pre$p" "$pre*/$p" "$pre$p/*" "$pre*/$p/*")
+            ;;
+    esac
+    return 0
+}
+
+trim() {
+    local s=$1
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# read_ignore FILE PREFIX - load an ignore file; PREFIX is its folder in the zip.
+read_ignore() {
+    local file=$1 pre=$2 line p
+    [ -f "$file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=$(trim "${line%$'\r'}")
+        case $line in
+            '' | '#'*) ;;
+            noscan:*)
+                p=$(trim "${line#noscan:}")
+                p=${p#/}
+                p=${p%/}
+                [ -n "$p" ] && NOSCAN+=("$pre$p" "$pre$p/*")
+                ;;
+            *) add_rule "$pre" "$line" ;;
+        esac
+    done <"$file"
+}
+
+# Reads `zip -dc` output ("done/left adding: path") and drives the status line.
+zip_progress() {
+    local line k=0 cur tot re='^[[:space:]]*([0-9]+)/[[:space:]]*([0-9]+)'
+    while IFS= read -r line; do
+        case $line in
+            'zip '*)
+                printf '%s\n' "$line" >>"$TMP/zip.out"
+                continue
+                ;;
+        esac
+        k=$((k + 1))
+        [ $((k % 20)) -eq 1 ] || continue
+        if [[ $line =~ $re ]]; then
+            cur=$((BASH_REMATCH[1] + 1))
+            tot=$((BASH_REMATCH[1] + BASH_REMATCH[2]))
+            [ "$tot" -gt 0 ] && say "zipping $cur/$tot ($((100 * cur / tot))%)"
+        fi
+    done
+}
+
+# grep --null output ("path\0line:text") -> "path:line". Never prints the text.
+# NUL becomes \001 first: BSD awk cannot hold NUL bytes in a record.
+null_hits() {
+    tr '\000' '\001' | LC_ALL=C awk '{
+        i = index($0, "\001")
+        if (i == 0) next
+        n = substr($0, i + 1); sub(/:.*/, "", n)
+        print substr($0, 1, i - 1) ":" n
+    }'
+}
+
+# run_gitleaks DIR REPORT [raw] - scan DIR, write a JSON report.
+# "raw" keeps the secret values in the report (needed by --redact); the report
+# lives in the private temp folder and is deleted on exit.
+run_gitleaks() {
+    local dir=$1 report=$2 base parent
+    local opts=(--no-banner --log-level error --report-format json --report-path "$report")
+    [ "${3:-}" = raw ] || opts+=(--redact)
+    [ -n "$GITLEAKS_CONFIG_FILE" ] && opts+=(--config "$GITLEAKS_CONFIG_FILE")
+    base=$(basename "$dir")
+    parent=$(dirname "$dir")
+    rm -f "$report"
+    if "$GITLEAKS" dir --help >/dev/null 2>&1; then
+        set -- dir "$base" # gitleaks >= 8.19
+    else
+        set -- detect --no-git --source "$base"
+    fi
+    # GITLEAKS_CONFIG would override ziproj's choice of rules: drop it.
+    (unset GITLEAKS_CONFIG && cd "$parent" && "$GITLEAKS" "$@" "${opts[@]}") >/dev/null 2>&1
+    [ -s "$report" ]
+}
+
+# The project must not be able to switch the scan off: remove its gitleaks
+# config and ignore files from the scan copy, and defuse inline allow comments.
+# Only the scan copy is touched; the zip keeps the files as they are.
+neutralize_gitleaks_settings() { # neutralize_gitleaks_settings DIR
+    local dir=$1 f
+    find "$dir" \( -name .gitleaks.toml -o -name .gitleaksignore \) -type f -exec rm -f {} + 2>/dev/null
+    while IFS= read -r f; do
+        LC_ALL=C sed 's/gitleaks:allow/gitleaks-allow-ignored-by-ziproj/g' "$f" >"$f.ziproj" && mv -f "$f.ziproj" "$f"
+    done < <(grep -rlF 'gitleaks:allow' "$dir" 2>/dev/null)
+}
+
+# gitleaks JSON report -> "path<TAB>line<TAB>rule" lines.
+parse_gitleaks() {
+    if have_jq; then
+        "$JQ" -r '.[] | [.File, (.StartLine | tostring), .RuleID] | @tsv' "$1" 2>/dev/null
+    else
+        # Without jq: gitleaks writes one key per line, File after RuleID and StartLine.
+        LC_ALL=C awk '
+            /^ *"RuleID": /    { r = $0; sub(/^ *"RuleID": *"/, "", r); sub(/",? *$/, "", r) }
+            /^ *"StartLine": / { l = $0; gsub(/[^0-9]/, "", l) }
+            /^ *"File": /      { f = $0; sub(/^ *"File": *"/, "", f); sub(/",? *$/, "", f); print f "\t" l "\t" r }
+        ' "$1"
+    fi
+}
+
+# Path inside the scan copy -> path inside the zip.
+scan_path() { printf '%s' "${1#*ziproj-scan/}"; }
+
+# awk program used by --redact. Replaces every known secret value (and the rest
+# of its token, since some rules capture only a prefix) with REDACTED, and
+# whole PEM private key blocks with REDACTED-PRIVATE-KEY.
+read -r -d '' REDACT_AWK <<'AWK'
+BEGIN {
+    while ((getline v < vf) > 0) if (length(v) >= 6) vals[++n] = v
+    close(vf)
+}
+function redact(s,    i, p, out, rest) {
+    for (i = 1; i <= n; i++) {
+        out = ""
+        while ((p = index(s, vals[i])) > 0) {
+            out = out substr(s, 1, p - 1) "REDACTED"
+            rest = substr(s, p + length(vals[i]))
+            if (match(rest, /^[A-Za-z0-9_+\/=-]+/)) rest = substr(rest, RLENGTH + 1)
+            s = rest
+        }
+        s = out s
+    }
+    return s
+}
+{
+    line = $0
+    if (inkey) {
+        if (!match(line, /-----END[A-Z0-9 ]*PRIVATE KEY-----/)) next
+        line = substr(line, RSTART + RLENGTH)
+        inkey = 0
+        if (line == "") next
+    }
+    while (match(line, /-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----/)) {
+        head = substr(line, 1, RSTART - 1)
+        tail = substr(line, RSTART + RLENGTH)
+        if (match(tail, /-----END[A-Z0-9 ]*PRIVATE KEY-----/)) {
+            line = head "REDACTED-PRIVATE-KEY" substr(tail, RSTART + RLENGTH)
+        } else {
+            line = head "REDACTED-PRIVATE-KEY"
+            inkey = 1
+            break
+        }
+    }
+    print redact(line)
+}
+AWK
+
+TMP=""
+# shellcheck disable=SC2317 # called from the traps below
+cleanup() {
+    say
+    [ -n "$TMP" ] && rm -rf "$TMP"
+}
+trap cleanup EXIT
+trap 'cleanup; trap - EXIT; exit 130' INT
+trap 'cleanup; trap - EXIT; exit 143' TERM
+
+# --------------------------------------------------------------------------
+# Arguments
+# --------------------------------------------------------------------------
+
+DRY_RUN=0 REDACT=0 FORCE=0 AI=0 NO_GITLEAKS=0 NO_OPEN=${ZIPROJ_NO_OPEN:-0}
+OUT_ARG="" ROOT_ARG=""
+USER_EXCLUDES=()
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h | --help) usage; exit 0 ;;
+        -V | --version) echo "ziproj $ZIPROJ_VERSION"; exit 0 ;;
+        -n | --dry-run) DRY_RUN=1 ;;
+        -r | --redact) REDACT=1 ;;
+        -a | --ai) AI=1 ;;
+        -f | --force) FORCE=1 ;;
+        --no-gitleaks) NO_GITLEAKS=1 ;;
+        --no-open) NO_OPEN=1 ;;
+        -x | --exclude)
+            [ $# -ge 2 ] || usage_error "option '$1' needs a pattern"
+            USER_EXCLUDES+=("$2")
+            shift
+            ;;
+        --exclude=*) USER_EXCLUDES+=("${1#*=}") ;;
+        -o | --out)
+            [ $# -ge 2 ] || usage_error "option '$1' needs a directory"
+            OUT_ARG=$2
+            shift
+            ;;
+        --out=*) OUT_ARG=${1#*=} ;;
+        --)
+            shift
+            break
+            ;;
+        -[!-]?*)
+            # Bundled short options: -nr -> -n -r, -xbuild -> -x build
+            case ${1:0:2} in
+                -x | -o) set -- "${1:0:2}" "${1:2}" "${@:2}" ;;
+                *) set -- "${1:0:2}" "-${1:2}" "${@:2}" ;;
+            esac
+            continue
+            ;;
+        -*) usage_error "unknown option '$1'" ;;
+        *)
+            [ -z "$ROOT_ARG" ] || usage_error "only one directory can be given"
+            ROOT_ARG=$1
+            ;;
+    esac
+    shift
+done
+if [ $# -gt 0 ]; then
+    if [ -n "$ROOT_ARG" ] || [ $# -gt 1 ]; then
+        usage_error "only one directory can be given"
+    fi
+    ROOT_ARG=$1
+fi
+
+for tool in zip unzip find grep awk xargs sort cut; do
+    have "$tool" || die "'$tool' is required but was not found in PATH"
+done
+
+# --------------------------------------------------------------------------
+# Source and destination
+# --------------------------------------------------------------------------
+
+ROOT_ARG=${ROOT_ARG:-.}
+[ -d "$ROOT_ARG" ] || die "not a directory: $ROOT_ARG"
+ROOT=$(cd "$ROOT_ARG" && pwd -P) || die "cannot open $ROOT_ARG"
+HOME_REAL=$(cd "$HOME" 2>/dev/null && pwd -P) || HOME_REAL=$HOME
+if [ "$ROOT" = / ] || [ "$ROOT" = "$HOME_REAL" ]; then
+    die "refusing to zip $ROOT"
+fi
+case "$HOME_REAL/" in
+    "$ROOT"/*) die "refusing to zip $ROOT: it contains your home folder" ;;
+esac
+
+OUTDIR=${OUT_ARG:-${ZIPROJ_OUT:-$HOME/Downloads}}
+[ -d "$OUTDIR" ] || die "output folder does not exist: $OUTDIR (use -o DIR or set ZIPROJ_OUT)"
+OUTDIR=$(cd "$OUTDIR" && pwd -P) || die "cannot open $OUTDIR"
+NAME=$(basename "$ROOT")
+ZIPNAME="$OUTDIR/$NAME.zip"
+
+# --------------------------------------------------------------------------
+# gitleaks: without it the scan is much weaker, so ask before going on
+# --------------------------------------------------------------------------
+
+if [ "$NO_GITLEAKS" = 0 ] && ! have "$GITLEAKS" && [ "$DRY_RUN" = 0 ]; then
+    cat >&2 <<EOF
+${E_YEL}ziproj: gitleaks is not installed.${E_OFF}
+  gitleaks is the main secret scanner: hundreds of rules plus entropy checks.
+  Without it only ziproj's built-in patterns run (~17 well-known formats), so
+  generic API keys, passwords and less common tokens would end up in the zip
+  ${E_BLD}in plain text${E_OFF}.
+  Install it:  brew install gitleaks   (other options: https://github.com/gitleaks/gitleaks)
+EOF
+    [ -t 0 ] || die "not an interactive terminal: install gitleaks, or pass --no-gitleaks"
+    printf '  Continue without gitleaks? [y/N] ' >&2
+    answer=""
+    read -r answer || answer=""
+    case $answer in
+        y | Y | yes | YES | Yes) NO_GITLEAKS=1 ;;
+        *)
+            echo "  Aborted." >&2
+            exit 1
+            ;;
+    esac
+fi
+if [ "$REDACT" = 1 ] && have_gitleaks && ! have_jq; then
+    die "--redact needs jq to read the gitleaks report (brew install jq / apt install jq)"
+fi
+
+# --------------------------------------------------------------------------
+# Exclusion rules
+# --------------------------------------------------------------------------
+
+EXCLUDES=()
+NOSCAN=()
+CI_SECRET_FILES=()
+while IFS= read -r p; do CI_SECRET_FILES+=("$p"); done < <(printf '%s\n' "${SECRET_FILES[@]}" | ci_patterns)
+CI_SECRET_DIRS=()
+while IFS= read -r p; do CI_SECRET_DIRS+=("$p"); done < <(printf '%s\n' "${SECRET_DIRS[@]}" | ci_patterns)
+for p in "${CI_SECRET_FILES[@]}" "${JUNK_FILES[@]}"; do
+    EXCLUDES+=("$p" "*/$p")
+done
+for p in "${CI_SECRET_DIRS[@]}" "${JUNK_DIRS[@]}"; do
+    EXCLUDES+=("$p/*" "*/$p/*")
+done
+for p in "${USER_EXCLUDES[@]}"; do
+    add_rule "" "$p"
+done
+if [ "$AI" = 1 ]; then
+    while IFS= read -r p; do
+        EXCLUDES+=("$p")
+    done < <(printf '*.%s\n' "${AI_EXTENSIONS[@]}" | ci_patterns)
+fi
+read_ignore "${XDG_CONFIG_HOME:-$HOME/.config}/ziproj/ignore" ""
+
+# Never leave an old zip behind: if this run is blocked or fails, there is
+# nothing stale left to upload by mistake.
+OLD_REMOVED=0
+if [ "$DRY_RUN" = 0 ] && [ -e "$ZIPNAME" ]; then
+    rm -f "$ZIPNAME" && OLD_REMOVED=1
+fi
+
+# --------------------------------------------------------------------------
+# 1. File list
+# --------------------------------------------------------------------------
+
+cd "$ROOT" || die "cannot enter $ROOT"
+START=$(date +%s)
+REPOS=()
+RAW=()
+if have git && [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+    MODE="git"
+    REPOS=(.)
+else
+    # Directories to skip while walking: same as the denylist, for speed.
+    PRUNE=()
+    for d in "${SECRET_DIRS[@]}" "${JUNK_DIRS[@]}"; do
+        case $d in
+            */*) PRUNE+=(-o -path "*/$d") ;;
+            *) PRUNE+=(-o -name "$d") ;;
+        esac
+    done
+    PRUNE=("${PRUNE[@]:1}")
+
+    if have git; then
+        say "looking for git repositories…"
+        FOUND=()
+        while IFS= read -r -d '' g; do
+            r=${g%/.git}
+            r=${r#./}
+            [ "$r" = . ] || FOUND+=("$r")
+        done < <(find . -name .git -prune -print0 -o -type d \( "${PRUNE[@]}" \) -prune)
+        # Repositories inside other repositories are submodules: the parent lists them.
+        for r in "${FOUND[@]}"; do
+            nested=0
+            for q in "${FOUND[@]}"; do
+                case $r in "$q"/*) nested=1 ;; esac
+            done
+            [ "$nested" = 0 ] && REPOS+=("$r")
+        done
+    fi
+
+    MODE="find"
+    [ ${#REPOS[@]} -gt 0 ] && MODE="find + ${#REPOS[@]} git repos"
+    REPO_PRUNE=()
+    for r in "${REPOS[@]}"; do
+        REPO_PRUNE+=(-o -path "./$r")
+    done
+    say "listing files outside repositories…"
+    while IFS= read -r -d '' f; do
+        RAW+=("${f#./}")
+    done < <(find . -type d \( "${PRUNE[@]}" "${REPO_PRUNE[@]}" \) -prune -o \( -type f -o -type l \) -print0)
+fi
+
+i=0
+for r in "${REPOS[@]}"; do
+    i=$((i + 1))
+    pre=""
+    if [ "$r" = . ]; then
+        say "git ls-files…"
+    else
+        pre="$r/"
+        say "git ls-files $i/${#REPOS[@]}: $r"
+        read_ignore "$r/.ziprojignore" "$pre"
+    fi
+    while IFS= read -r -d '' f; do
+        RAW+=("$pre$f")
+    done < <(
+        git -C "$r" ls-files -z --cached --recurse-submodules 2>/dev/null
+        git -C "$r" ls-files -z --others --exclude-standard 2>/dev/null
+    )
+done
+read_ignore ".ziprojignore" ""
+[ "$AI" = 1 ] && MODE="$MODE, ai"
+
+say "checking ${#RAW[@]} files…"
+FILES=()
+for f in "${RAW[@]}"; do
+    case $f in *$'\n'*) continue ;; esac # zip -@ reads one name per line
+    if [ -L "$f" ] || [ -f "$f" ]; then
+        FILES+=("$f")
+    fi
+done
+[ ${#FILES[@]} -gt 0 ] || die "no files found in $ROOT"
+
+# --------------------------------------------------------------------------
+# 2. Zip into a private temporary folder
+# --------------------------------------------------------------------------
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/ziproj.XXXXXX") || die "cannot create a temporary folder"
+TMPZIP="$TMP/$NAME.zip"
+
+say "zipping…"
+# Patterns go through a file, so one starting with "-" is never read as an option.
+printf '%s\n' "${EXCLUDES[@]}" >"$TMP/exclude.lst"
+# -y stores symlinks as links (never follows them out of the project)
+# -X drops uid/gid and extra attributes
+# -dc prints "done/left" per entry, which drives the progress line
+printf '%s\n' "${FILES[@]}" |
+    zip -y -X -dc "$TMPZIP" -@ -x@"$TMP/exclude.lst" 2>"$TMP/zip.err" |
+    zip_progress
+ZIP_STATUS=${PIPESTATUS[1]}
+say
+
+case $ZIP_STATUS in
+    0 | 18) ;; # 18: some files could not be read (they vanished meanwhile)
+    12) die "everything was excluded, nothing to zip" ;;
+    *)
+        cat "$TMP/zip.out" "$TMP/zip.err" >&2 2>/dev/null
+        die "zip failed (exit $ZIP_STATUS)"
+        ;;
+esac
+
+# --------------------------------------------------------------------------
+# 3. Secret scan, on exactly what is inside the zip
+# --------------------------------------------------------------------------
+
+LISTED=() # every file in the zip
+SCAN=()   # files to scan
+SKIPPED=() # symlinks and "noscan" files
+while IFS= read -r e; do
+    case $e in */) continue ;; esac
+    LISTED+=("$e")
+    skip=0
+    [ -L "$e" ] && skip=1
+    if [ "$skip" = 0 ]; then
+        for p in "${NOSCAN[@]}"; do
+            # shellcheck disable=SC2053 # $p is a glob on purpose
+            if [[ $e == $p ]]; then
+                skip=1
+                break
+            fi
+        done
+    fi
+    if [ "$skip" = 1 ]; then SKIPPED+=("$e"); else SCAN+=("$e"); fi
+done < <(unzip -Z1 "$TMPZIP")
+
+RE=$(IFS='|'; printf '%s' "${SECRET_PATTERNS[*]}")
+HITS=()    # "path:line" or "path:line (gitleaks rule)"; never the value
+SECRETS=() # values matched by the built-in patterns (only with --redact)
+
+if [ ${#SCAN[@]} -gt 0 ]; then
+    say "scanning ${#SCAN[@]} files (built-in patterns)…"
+    while IFS= read -r h; do
+        HITS+=("$h")
+    done < <(printf '%s\0' "${SCAN[@]}" | xargs -0 grep -nIHE --null -e "$RE" -- 2>/dev/null | null_hits)
+
+    if [ "$REDACT" = 1 ] && [ ${#HITS[@]} -gt 0 ]; then
+        HIT_FILES=()
+        for h in "${HITS[@]}"; do
+            f=$(hit_path "$h")
+            contains "$f" "${HIT_FILES[@]}" || HIT_FILES+=("$f")
+        done
+        while IFS= read -r m; do
+            SECRETS+=("${m#[!A-Za-z0-9_-]}") # drop the delimiter some patterns match first
+        done < <(printf '%s\0' "${HIT_FILES[@]}" | xargs -0 grep -ohIE -e "$RE" -- 2>/dev/null)
+    fi
+fi
+
+SCAN_COPY="$TMP/ziproj-scan"
+if [ ${#SCAN[@]} -gt 0 ] && have_gitleaks; then
+    say "scanning ${#SCAN[@]} files with gitleaks…"
+    mkdir "$SCAN_COPY"
+    unzip -qq "$TMPZIP" -d "$SCAN_COPY" 2>/dev/null
+    for e in "${SKIPPED[@]}"; do
+        rm -f -- "$SCAN_COPY/$e"
+    done
+    neutralize_gitleaks_settings "$SCAN_COPY"
+    report_mode=redacted
+    [ "$REDACT" = 1 ] && report_mode=raw
+    if ! run_gitleaks "$SCAN_COPY" "$TMP/gitleaks.json" "$report_mode"; then
+        die "gitleaks failed to run; fix it, or skip it with --no-gitleaks"
+    fi
+    MODE="$MODE, gitleaks"
+    KEYS=("${HITS[@]}")
+    while IFS=$'\t' read -r gpath gline grule; do
+        [ -n "$gpath" ] || continue
+        k="$(scan_path "$gpath"):$gline"
+        contains "$k" "${KEYS[@]}" && continue
+        KEYS+=("$k")
+        HITS+=("$k ($grule)")
+    done < <(parse_gitleaks "$TMP/gitleaks.json")
+else
+    MODE="$MODE, built-in scan only"
+fi
+
+if [ ${#HITS[@]} -gt 0 ]; then
+    SORTED=()
+    while IFS= read -r h; do SORTED+=("$h"); done < <(printf '%s\n' "${HITS[@]}" | sort -t: -k1,1 -k2,2n)
+    HITS=("${SORTED[@]}")
+fi
+
+# --------------------------------------------------------------------------
+# 4. --redact: rewrite the affected files inside the zip, then scan again
+# --------------------------------------------------------------------------
+
+REDACTED=()
+if [ "$REDACT" = 1 ] && [ ${#HITS[@]} -gt 0 ]; then
+    say "redacting ${#HITS[@]} findings…"
+    RED="$TMP/redacted"
+    VALUES="$TMP/values"
+    {
+        printf '%s\n' "${SECRETS[@]}"
+        # gitleaks' raw report holds the values; a multi-line value becomes one line each
+        [ -s "$TMP/gitleaks.json" ] && "$JQ" -r '.[] | (.Secret // empty)' "$TMP/gitleaks.json" 2>/dev/null
+    } | LC_ALL=C awk 'length($0) >= 6' | LC_ALL=C sort -u >"$VALUES"
+
+    RFILES=()
+    for h in "${HITS[@]}"; do
+        f=$(hit_path "$h")
+        contains "$f" "${RFILES[@]}" || RFILES+=("$f")
+    done
+    REDACTED=("${HITS[@]}")
+
+    # The same value in files nobody flagged (e.g. a key repeated in another config).
+    if [ -s "$VALUES" ]; then
+        while IFS= read -r f; do
+            contains "$f" "${RFILES[@]}" && continue
+            RFILES+=("$f")
+            REDACTED+=("$f (same value)")
+        done < <(printf '%s\0' "${SCAN[@]}" | xargs -0 grep -lIF -f "$VALUES" -- 2>/dev/null)
+    fi
+
+    for f in "${RFILES[@]}"; do
+        mkdir -p "$RED/$(dirname "$f")"
+        LC_ALL=C awk -v vf="$VALUES" "$REDACT_AWK" "$f" >"$RED/$f"
+    done
+    (cd "$RED" && printf '%s\n' "${RFILES[@]}" | zip -q -X "$TMPZIP" -@) >/dev/null 2>&1
+    UPDATE_STATUS=$?
+
+    # Verify: whatever is still detected stays a blocking finding.
+    say "verifying the redacted files…"
+    RESIDUAL=()
+    [ "$UPDATE_STATUS" -eq 0 ] || RESIDUAL+=("(could not update the zip)")
+    while IFS= read -r h; do
+        RESIDUAL+=("$h")
+    done < <(cd "$RED" && printf '%s\0' "${RFILES[@]}" | xargs -0 grep -nIHE --null -e "$RE" -- 2>/dev/null | null_hits)
+    if [ -d "$SCAN_COPY" ]; then
+        for f in "${RFILES[@]}"; do
+            cp -- "$RED/$f" "$SCAN_COPY/$f"
+        done
+        neutralize_gitleaks_settings "$SCAN_COPY"
+        if run_gitleaks "$SCAN_COPY" "$TMP/gitleaks-verify.json"; then
+            while IFS=$'\t' read -r gpath gline grule; do
+                [ -n "$gpath" ] && RESIDUAL+=("$(scan_path "$gpath"):$gline ($grule)")
+            done < <(parse_gitleaks "$TMP/gitleaks-verify.json")
+        else
+            RESIDUAL+=("(gitleaks could not verify the redacted files)")
+        fi
+    fi
+
+    HITS=()
+    KEYS=()
+    for h in "${RESIDUAL[@]}"; do
+        k=$(hit_key "$h")
+        contains "$k" "${KEYS[@]}" && continue
+        KEYS+=("$k")
+        HITS+=("$h")
+    done
+fi
+
+# --------------------------------------------------------------------------
+# 5. Result
+# --------------------------------------------------------------------------
+
+# Largest files (>= 1 MB), to spot dead weight.
+HEAVY=()
+while IFS= read -r h; do
+    HEAVY+=("$h")
+done < <(unzip -Z "$TMPZIP" 2>/dev/null | LC_ALL=C awk '$1 ~ /^[-l]/ && $4 ~ /^[0-9]+$/ && $4 >= 1048576 {
+        n = $0; for (i = 0; i < 8; i++) sub(/^[ \t]*[^ \t]+[ \t]+/, "", n)
+        printf "%d\t%6.1f MB  %s\n", $4, $4 / 1048576, n }' | sort -rn | head -5 | cut -f2-)
+
+say
+SECS=$(($(date +%s) - START))
+SIZE=$(du -h "$TMPZIP" | cut -f1 | tr -d ' ')
+FILES_WORD="files"
+[ ${#LISTED[@]} -eq 1 ] && FILES_WORD="file"
+HEAD="$NAME [$MODE] ${#LISTED[@]} $FILES_WORD"
+STATUS=0
+BLOCKED=0
+
+print_list() { # print_list ITEM... (max 20)
+    local n=0 item
+    for item in "$@"; do
+        n=$((n + 1))
+        if [ $n -gt 20 ]; then
+            printf '    … and %d more\n' $(($# - 20))
+            break
+        fi
+        printf '    %s\n' "$item"
+    done
+}
+
+if [ "$DRY_RUN" = 1 ]; then
+    print_list_all() { local item; for item in "$@"; do printf '    %s\n' "$item"; done; }
+    print_list_all "${LISTED[@]}"
+    printf '  %s%s%s — dry run, nothing written (~%s)\n' "$O_BLD" "$HEAD" "$O_OFF" "$SIZE"
+elif [ ${#HITS[@]} -gt 0 ] && [ "$FORCE" = 0 ]; then
+    BLOCKED=1
+    printf '  %s — %sBLOCKED, no zip written%s\n' "$HEAD" "$E_RED$E_BLD" "$E_OFF" >&2
+    [ "$OLD_REMOVED" = 1 ] && printf '  %s(the previous %s.zip was removed too)%s\n' "$E_DIM" "$NAME" "$E_OFF" >&2
+else
+    mv "$TMPZIP" "$ZIPNAME" || die "cannot write $ZIPNAME"
+    SHOWN=$ZIPNAME
+    # shellcheck disable=SC2088 # a literal ~ for display
+    case $ZIPNAME in "$HOME_REAL"/*) SHOWN="~${ZIPNAME#"$HOME_REAL"}" ;; esac
+    printf '  %s%s%s — %s%s%s in %ss → %s\n' "$O_BLD" "$HEAD" "$O_OFF" "$O_GRN" "$SIZE" "$O_OFF" "$SECS" "$SHOWN"
+fi
+
+if [ ${#HEAVY[@]} -gt 0 ]; then
+    printf '  %slargest files:%s\n' "$O_DIM" "$O_OFF"
+    print_list "${HEAVY[@]}"
+fi
+if [ ${#REDACTED[@]} -gt 0 ] && [ "$BLOCKED" = 0 ]; then
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  secrets that would be redacted (%d):\n' ${#REDACTED[@]}
+    else
+        printf '  secrets redacted in the zip (%d):\n' ${#REDACTED[@]}
+    fi
+    print_list "${REDACTED[@]}"
+fi
+if [ ${#HITS[@]} -gt 0 ]; then
+    if [ "$REDACT" = 1 ]; then
+        printf '  %s⚠ redaction incomplete, still in plain text (%d):%s\n' "$E_YEL" ${#HITS[@]} "$E_OFF" >&2
+    else
+        printf '  %s⚠ possible secrets (%d):%s\n' "$E_YEL" ${#HITS[@]} "$E_OFF" >&2
+    fi
+    print_list "${HITS[@]}" >&2
+    if [ "$FORCE" = 0 ]; then
+        STATUS=1
+        if [ "$REDACT" = 1 ]; then
+            echo "  remove them by hand, or exclude those files (-x or .ziprojignore)" >&2
+        else
+            echo "  re-run with -r to redact them inside the zip" >&2
+        fi
+    fi
+fi
+
+# Reveal the new zip, ready to drag into a chat.
+if [ "$DRY_RUN" = 0 ] && [ "$BLOCKED" = 0 ] && [ "$NO_OPEN" = 0 ] && [ -t 1 ]; then
+    case $(uname -s) in
+        Darwin) open -R "$ZIPNAME" >/dev/null 2>&1 ;;
+        Linux)
+            if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && have xdg-open; then
+                xdg-open "$OUTDIR" >/dev/null 2>&1 &
+            fi
+            ;;
+    esac
+fi
+
+exit "$STATUS"

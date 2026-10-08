@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install linters
+        run: sudo apt-get update && sudo apt-get install -y shellcheck mandoc zsh fish
+      - run: make lint
+
+  test:
+    name: test (${{ matrix.os }}, gitleaks ${{ matrix.gitleaks && 'on' || 'off' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        gitleaks: [true, false]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu's package is an older gitleaks (no `dir` command), macOS gets the
+      # current release: together they cover both code paths in ziproj.
+      - name: Install gitleaks and jq (Ubuntu)
+        if: matrix.gitleaks && runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gitleaks jq
+
+      - name: Install gitleaks and jq (macOS)
+        if: matrix.gitleaks && runner.os == 'macOS'
+        run: brew install gitleaks jq
+
+      - name: Tool versions
+        run: |
+          bash --version | head -1
+          /bin/bash --version | head -1
+          zip -v | sed -n 2p
+          gitleaks version 2>/dev/null || echo "gitleaks: not installed"
+
+      # On macOS, `make test` runs ziproj with /bin/bash (bash 3.2).
+      - run: make test

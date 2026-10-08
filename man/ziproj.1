@@ -1,0 +1,305 @@
+.TH ZIPROJ 1 "2026-10-08" "ziproj 1.0.0" "User Commands"
+.SH NAME
+ziproj \- zip a project to share with an AI assistant or a colleague, without secrets or build junk
+.SH SYNOPSIS
+.B ziproj
+.RB [ \-n ]
+.RB [ \-r ]
+.RB [ \-a ]
+.RB [ \-f ]
+.RB [ \-x
+.IR pattern ]...
+.RB [ \-o
+.IR dir ]
+.RB [ \-\-no\-gitleaks ]
+.RB [ \-\-no\-open ]
+.RI [ directory ]
+.SH DESCRIPTION
+.B ziproj
+creates
+.IR name .zip
+from
+.I directory
+(the current directory by default), where
+.I name
+is the directory's name.
+It leaves out files that commonly hold secrets and files that only add weight,
+then scans what is left for secrets before writing anything.
+.PP
+The steps, in order:
+.IP 1. 4
+List the files.
+Inside a git repository the list comes from
+.BR "git ls-files" ,
+so
+.I .gitignore
+is honoured, untracked files that are not ignored are included,
+and submodules are followed.
+In a folder that is not a repository, each nested repository is listed
+through git and everything else through
+.BR find (1).
+.IP 2. 4
+Zip the list into a private temporary folder, applying the default exclusions,
+the ignore files and the
+.B \-x
+patterns.
+Symbolic links are stored as links and never followed.
+.IP 3. 4
+Scan exactly what is in the zip for secrets: built-in patterns, plus
+.BR gitleaks (1)
+when it is installed.
+.IP 4. 4
+If secrets are found, stop (default), or replace them with
+.B REDACTED
+inside the zip
+.RB ( \-r )
+and scan again to verify.
+.IP 5. 4
+Only when everything passed, move the zip to the output folder and reveal it
+in Finder (macOS) or the file manager (Linux desktop).
+.PP
+Your files are never modified.
+A zip left over from an earlier run is deleted at the start of every run that
+writes, so a blocked or failed run never leaves a stale zip to upload by mistake.
+.SH OPTIONS
+.TP
+.BR \-n ", " \-\-dry\-run
+List what would be zipped and scan it.
+Nothing is written.
+.TP
+.BR \-r ", " \-\-redact
+Replace each detected secret with
+.B REDACTED
+inside the zip instead of blocking.
+Private key blocks become
+.BR REDACTED\-PRIVATE\-KEY .
+A value found in one file is also replaced in every other file that contains it.
+The redacted files are scanned again; anything still detected blocks the zip.
+With gitleaks installed this option needs
+.BR jq (1).
+.TP
+.BR \-a ", " \-\-ai
+AI mode: also leave out images, PDFs, fonts, audio, video and design files,
+which an AI assistant reading code does not need.
+.TP
+.BR \-x ", " \-\-exclude " \fIpattern\fR"
+Leave out a file, a directory or a glob, at any depth.
+A leading
+.B /
+anchors the pattern to the project root.
+Can be repeated.
+.TP
+.BR \-o ", " \-\-out " \fIdir\fR"
+Write the zip to
+.IR dir .
+The default is
+.B $ZIPROJ_OUT
+if set, otherwise
+.IR ~/Downloads .
+.TP
+.BR \-f ", " \-\-force
+Write the zip even if secrets are still in plain text.
+Prefer
+.BR \-r .
+.TP
+.B \-\-no\-gitleaks
+Do not use gitleaks, even if installed, and do not ask about it.
+.TP
+.B \-\-no\-open
+Do not reveal the zip after writing it.
+.TP
+.BR \-h ", " \-\-help
+Show a summary of the options.
+.TP
+.BR \-V ", " \-\-version
+Show the version.
+.PP
+Short options can be bundled:
+.B ziproj \-nra
+is
+.BR "ziproj \-n \-r \-a" .
+.SH IGNORE FILES
+Rules are read, in this order, from:
+.TP
+.I ~/.config/ziproj/ignore
+Applies to every project.
+.B $XDG_CONFIG_HOME
+is honoured.
+.TP
+.IR directory /.ziprojignore
+Applies to the project.
+.TP
+.IR repository /.ziprojignore
+In each repository nested inside
+.IR directory ,
+relative to that repository.
+.PP
+One rule per line.
+Blank lines and lines starting with
+.B #
+are ignored.
+.TP
+.I pattern
+Exclude matching files and directories at any depth.
+.B *
+matches any characters, including
+.BR / .
+.TP
+.I /pattern
+Exclude only at the root of the folder that holds the ignore file.
+.TP
+.BI "noscan: " path
+Keep
+.I path
+(a file or a directory) in the zip but skip the secret scan on it.
+Use it for known false positives, such as test fixtures.
+.SH DEFAULT EXCLUSIONS
+Always left out, whether tracked by git or not.
+Secret file and folder names are matched in any letter case.
+.TP
+Secrets
+Environment files
+.RI ( .env ", " .env.* ", " .envrc ),
+credential files
+.RI ( .netrc ", " .npmrc ", " .pypirc ", " .git\-credentials ),
+keys and certificates
+.RI ( *.pem ", " *.key ", " *.p8 ", " *.p12 ", " *.jks ", " *.keystore ),
+provisioning profiles,
+.IR GoogleService\-Info.plist ,
+.IR google\-services.json ,
+service account JSON files,
+.IR Secret.* " and " Secrets.* ,
+.IR local.properties ,
+Terraform state and variables, local databases, and the
+.IR .ssh ", " .aws ", " .gnupg ", " .docker ", " .kube
+and
+.I secrets
+directories.
+.TP
+Weight
+Version control data, dependencies
+.RI ( node_modules ", " Pods ", " .venv ),
+build output
+.RI ( build ", " dist ", " .build ", " DerivedData ", " target ", " .next ),
+caches, logs, OS litter
+.RI ( .DS_Store ),
+compiled objects, app packages
+.RI ( *.ipa ", " *.apk ", " *.aab )
+and archives.
+.PP
+The complete list is in the source and in the project documentation.
+.SH SECRET SCANNING
+The built-in patterns recognise private keys and common token formats
+(AWS, Google, OpenAI, Anthropic, GitHub, GitLab, Slack, Stripe, SendGrid,
+npm, Hugging Face, Azure, JWTs and database URLs with a password).
+.PP
+.BR gitleaks (1),
+when installed, adds hundreds of rules and entropy checks, including generic
+API keys.
+If gitleaks is missing,
+.B ziproj
+explains the risk and asks before going on;
+in a non-interactive shell it stops unless
+.B \-\-no\-gitleaks
+is given.
+.PP
+The project cannot switch the scan off: in the copy that gitleaks scans,
+.I .gitleaks.toml
+and
+.I .gitleaksignore
+files are removed,
+.B gitleaks:allow
+comments are defused and
+.B GITLEAKS_CONFIG
+is ignored.
+Use
+.B noscan:
+rules for false positives.
+.PP
+Findings are printed as
+.IR path : line ,
+never with the secret value.
+.SH ENVIRONMENT
+.TP
+.B ZIPROJ_OUT
+Default output folder.
+.TP
+.B ZIPROJ_NO_OPEN
+Set to 1 to never reveal the zip.
+.TP
+.B ZIPROJ_GITLEAKS
+Path or name of the gitleaks executable.
+.TP
+.B ZIPROJ_GITLEAKS_CONFIG
+A gitleaks configuration file to scan with.
+Without it gitleaks uses its default rules.
+.TP
+.B ZIPROJ_JQ
+Path or name of the jq executable.
+.TP
+.B NO_COLOR
+Disable colours.
+.TP
+.B XDG_CONFIG_HOME
+Location of
+.IR ziproj/ignore .
+.SH EXIT STATUS
+.TP
+.B 0
+The zip was written, or a dry run found no secrets.
+.TP
+.B 1
+Secrets were found and nothing was written, the redaction could not be
+verified, or an error occurred.
+.TP
+.B 2
+Invalid options.
+.TP
+.B 130
+Interrupted (SIGINT).
+.TP
+.B 143
+Terminated (SIGTERM).
+.SH EXAMPLES
+Zip the current project into
+.IR ~/Downloads :
+.PP
+.RS
+.B ziproj
+.RE
+.PP
+See what would go in, without writing anything:
+.PP
+.RS
+.B ziproj \-n
+.RE
+.PP
+Share with an AI assistant: no media, secrets redacted:
+.PP
+.RS
+.B ziproj \-ar ~/Code/my\-app
+.RE
+.PP
+Leave out the store metadata and write to the desktop:
+.PP
+.RS
+.B ziproj \-x fastlane/metadata \-o ~/Desktop
+.RE
+.SH CAVEATS
+Scanning reduces risk; it cannot prove that a project is free of secrets.
+A credential in a format that neither the built-in patterns nor gitleaks
+recognise is zipped as is, with or without
+.BR \-r .
+Review the file list
+.RB ( \-n )
+before sharing anything sensitive, and keep secrets out of your repositories.
+.SH SEE ALSO
+.BR zip (1),
+.BR git\-ls\-files (1),
+.BR gitleaks (1),
+.BR jq (1)
+.PP
+https://github.com/carmelogallo/ziproj
+.SH AUTHOR
+Carmelo Gallo.
+Released under the MIT License.
