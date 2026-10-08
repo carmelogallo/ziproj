@@ -76,7 +76,7 @@ make install                       # ~/.local/bin, man page, completions
 # or: sudo make install PREFIX=/usr/local
 ```
 
-`make install` tells you if `~/.local/bin` is missing from your `PATH`, and how to add it for your shell. For zsh completions, make sure `~/.local/share/zsh/site-functions` is in your `fpath` before `compinit`.
+`make install` also tells you if `~/.local/bin` is missing from your `PATH` (see [below](#add-localbin-to-your-path)). For zsh completions, make sure `~/.local/share/zsh/site-functions` is in your `fpath` before `compinit`.
 
 To update, `git pull && make install`. To remove, `make uninstall`.
 
@@ -88,6 +88,16 @@ To update, `git pull && make install`. To remove, `make uninstall`.
 mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/carmelogallo/ziproj/main/bin/ziproj -o ~/.local/bin/ziproj
 chmod +x ~/.local/bin/ziproj
+```
+
+### Add `~/.local/bin` to your PATH
+
+Skip this if `command -v ziproj` already prints a path. Otherwise, once:
+
+```sh
+fish_add_path ~/.local/bin                                  # fish
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc     # zsh, then open a new terminal
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc    # bash, then open a new terminal
 ```
 
 ## Usage
